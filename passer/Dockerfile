@@ -11,7 +11,7 @@ COPY requirements.txt /app/
 RUN pip install --upgrade pip
 RUN pip install -r ./requirements.txt
 
-# EXPOSE 8000
+EXPOSE 80
 
 # Comando para iniciar o servidor
-CMD ["gunicorn", "--bind", "0.0.0.0:80", "app:app"]
+CMD ["uvicorn", "app:app", "--proxy-headers", "--host", "0.0.0.0", "--port", "80"]

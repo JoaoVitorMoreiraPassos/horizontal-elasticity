@@ -1,52 +1,46 @@
 """
-Matrix Multiplication API
+Matrix Multiplication API with Flask and Prometheus
 
-This FastAPI application provides an API endpoint for multiplying matrices with different processing types.
-Matrices multiplication can be done sequentially, in parallel using threads, or in parallel using multiprocessing.
-Results can be cached for faster retrieval.
-
+This Flask application provides an API endpoint for multiplying matrices
+with caching for optimization and Prometheus metrics for monitoring.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
-from prometheus_client import Gauge, generate_latest, start_http_server
-from typing import List
-import numpy as np
-import asyncio
-from functools import lru_cache
 import time
-import concurrent.futures
+import logging
+import numpy as np
+from functools import lru_cache
+from asgiref.wsgi import WsgiToAsgi
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from prometheus_flask_exporter import PrometheusMetrics
 
-
-app = FastAPI()
-
-# Allow all origins
-origins = ["http://proxy/"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["POST", "GET"],
-    allow_headers=["*"],
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
 )
+logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+asgi_app = WsgiToAsgi(app)
 
-class MatricesRequest(BaseModel):
-    """
-    Request model for matrix multiplication.
+# Enable CORS
+CORS(app, resources={r"/multiply-matrices/": {"origins": ["http://topicos_nginx/", "http://topicos_proxy/", "http://topicos_prometheus/"]}})
 
-    Attributes:
-    - matrix_a (List[List[float]]): The first matrix for multiplication.
-    - matrix_b (List[List[float]]): The second matrix for multiplication.
-    - cache (bool): Flag to indicate whether to use caching for results.
-    """
+# Enable Prometheus metrics
+metrics = PrometheusMetrics(app)
+metrics.info("app_info", "Matrix Multiplication API", version="1.0.0")
 
-    matrix_a: List[List[float]]
-    matrix_b: List[List[float]]
-    cache: bool
-
+# Custom metrics
+REQUEST_COUNT = metrics.counter(
+    "requests_total", "Total number of requests", labels={"endpoint": lambda: request.endpoint}
+)
+LATENCY = metrics.histogram(
+    "request_latency_seconds",
+    "Request latency in seconds",
+    labels={"endpoint": lambda: request.endpoint},
+)
 
 
 def matrices_to_tuple(matrix_a: np.ndarray, matrix_b: np.ndarray) -> tuple:
@@ -64,29 +58,26 @@ def matrices_to_tuple(matrix_a: np.ndarray, matrix_b: np.ndarray) -> tuple:
 
 
 @lru_cache(maxsize=128)
-def cached_multiply(matrix_a_bytes: bytes, matrix_b_bytes: bytes) -> np.ndarray:
+def cached_multiply(matrix_a_bytes: bytes, matrix_b_bytes: bytes, shape_b: tuple) -> np.ndarray:
     """
     Multiply matrices with caching.
 
     Args:
     - matrix_a_bytes (bytes): The first matrix in bytes.
     - matrix_b_bytes (bytes): The second matrix in bytes.
+    - shape_b (tuple): Shape of the second matrix.
 
     Returns:
     - np.ndarray: The result of the matrix multiplication.
     """
-    matrix_a = np.frombuffer(matrix_a_bytes, dtype=np.float64).reshape(-1, matrix_b.shape[0])
-    matrix_b = np.frombuffer(matrix_b_bytes, dtype=np.float64).reshape(matrix_b.shape)
+    matrix_a = np.frombuffer(matrix_a_bytes, dtype=np.float64).reshape(-1, shape_b[0])
+    matrix_b = np.frombuffer(matrix_b_bytes, dtype=np.float64).reshape(shape_b)
     return np.dot(matrix_a, matrix_b)
 
 
-async def multiply_matrices(
-    matrix_a: np.ndarray,
-    matrix_b: np.ndarray,
-    cache: bool,
-) -> np.ndarray:
+def multiply_matrices(matrix_a: np.ndarray, matrix_b: np.ndarray, cache: bool) -> np.ndarray:
     """
-    Multiply matrices based on the specified processing type.
+    Multiply matrices with optional caching.
 
     Args:
     - matrix_a (np.ndarray): The first matrix.
@@ -96,64 +87,81 @@ async def multiply_matrices(
     Returns:
     - np.ndarray: The result of the matrix multiplication.
     """
+    logger.info("Starting matrix multiplication.")
     if cache:
+        logger.info("Using caching for matrix multiplication.")
         key = matrices_to_tuple(matrix_a, matrix_b)
         try:
-            result = cached_multiply(key[0], key[1])
+            result = cached_multiply(key[0], key[1], matrix_b.shape)
+            logger.info("Result retrieved from cache.")
             return result
-        except Exception:
-            pass  # If not in cache, proceed to compute
+        except Exception as e:
+            logger.warning(f"Cache miss or error: {e}. Computing result.")
 
     result = np.dot(matrix_a, matrix_b)
+    logger.info("Matrix multiplication completed.")
 
     if cache:
+        logger.info("Storing result in cache.")
         cached_multiply.cache_clear()  # Clear cache to prevent memory overflow
-        cached_multiply(key[0], key[1])  # Store result in cache
+        cached_multiply(matrix_a.tobytes(), matrix_b.tobytes(), matrix_b.shape)  # Cache result
 
     return result
 
 
-@app.post("/multiply-matrices/")
-async def calculate_matrices(request: MatricesRequest):
+@app.route("/multiply-matrices/", methods=["POST"])
+@REQUEST_COUNT
+@LATENCY
+def calculate_matrices():
     """
     API endpoint to receive a request for matrix multiplication and return the result.
-
-    Args:
-    - request (MatricesRequest): The request object containing matrices and processing parameters.
 
     Returns:
     - response (dict): JSON-formatted dict representing the result and execution time.
     """
     start_time = time.time()
+    logger.info("Received request for matrix multiplication.")
 
-    # Convert lists to NumPy arrays
+    data = request.get_json()
+
+    if not data or "matrix_a" not in data or "matrix_b" not in data:
+        logger.error("Invalid request. Missing 'matrix_a' or 'matrix_b'.")
+        return jsonify({"error": "Invalid request. Provide 'matrix_a' and 'matrix_b'."}), 400
+
+    # Extract matrices and cache flag
     try:
-        matrix_a = np.array(request.matrix_a, dtype=np.float64)
-        matrix_b = np.array(request.matrix_b, dtype=np.float64)
+        matrix_a = np.array(data["matrix_a"], dtype=np.float64)
+        matrix_b = np.array(data["matrix_b"], dtype=np.float64)
+        cache = data.get("cache", False)
+        logger.info("Matrices and cache flag extracted successfully.")
     except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid matrix data") from e
+        logger.error(f"Error parsing matrices: {e}")
+        return jsonify({"error": "Invalid matrix data"}), 400
+
+    # Validate matrix dimensions
+    if matrix_a.shape[1] != matrix_b.shape[0]:
+        logger.error("Matrix dimensions do not match for multiplication.")
+        return jsonify({"error": "Matrix dimensions do not match for multiplication."}), 400
 
     # Perform matrix multiplication
     try:
-        result = await multiply_matrices(
-            matrix_a, matrix_b, request.cache
-        )
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve)) from ve
+        result = multiply_matrices(matrix_a, matrix_b, cache)
+        logger.info("Matrix multiplication successful.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Internal server error") from e
+        logger.error(f"Internal server error during multiplication: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
     execution_time = time.time() - start_time
+    logger.info(f"Matrix multiplication completed in {execution_time:.6f} seconds.")
 
-    # Convert result to list for JSON serialization
+    # Prepare response
     response = {
         "result": result.tolist(),
         "execution_time": execution_time,
     }
-    return response
+    return jsonify(response)
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    logger.info("Starting Matrix Multiplication API...")
+    app.run(host="0.0.0.0", port=8001)

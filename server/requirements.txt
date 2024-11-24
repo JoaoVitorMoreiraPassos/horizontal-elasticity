@@ -6,3 +6,9 @@ psutil==5.9.8
 httpx
 psutil
 prometheus-client
+prometheus-flask-exporter
+flask
+flask-cors
+asgiref
+prometheus-fastapi-instrumentator
+gunicorn
