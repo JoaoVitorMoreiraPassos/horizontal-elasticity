@@ -51,7 +51,6 @@ class MatricesRequest(BaseModel):
 
     matrix_a: list[list[float]]
     matrix_b: list[list[float]]
-    cache: bool
 
 
 service = Sevice("topicos_servidor", "http://topicos_servidor/")
@@ -104,12 +103,15 @@ async def multiply_matrices(request: MatricesRequest):
         service.ocupado = True
         logger.info(f"Forwarding request to loadbalancer {service.name}. Active requests: {service.requisicoes_ativas}")
         async with httpx.AsyncClient() as client:
+            request_data = request.dict()
+            request_data["cache"] = True
+            
             response = await client.post(
-                url=f"{service.url}multiply-matrices/",
-                json=request.dict(),
-                headers={"Content-Type": "application/json"},
-                timeout=60.0
-            )
+            url=f"{service.url}multiply-matrices/",
+            json=request_data,
+            headers={"Content-Type": "application/json"},
+            timeout=60.0
+        )
             response.raise_for_status()
             data = response.json()
         service.requisicoes_ativas -= 1
